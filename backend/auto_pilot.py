@@ -1,4 +1,4 @@
-"""异步托管 - 极简：红点在第几个就点第几个"""
+"""异步托管 - AI扫描侧边栏（画参考线精确读y坐标）+ 点击"""
 import threading, time, random, subprocess
 from config import cfg
 from window_capture import capture
@@ -8,45 +8,7 @@ from memory_store import memory_store
 from time_schedule import get_current_interval
 from name_list import is_blacklisted, needs_human_approval
 
-CHAT_X = 160  # ponytail: 侧边栏列表点击x（避开左侧导航图标栏）
-
-def detect_red_dots(img) -> list:
-    """纯算法检测侧边栏红点，返回[{y, x}]（像素检测，不耗API）"""
-    import numpy as np
-    arr = np.array(img)
-    # 红色: R>150, G<100, B<100, R-G>50
-    r, g, b = arr[:,:,0].astype(int), arr[:,:,1].astype(int), arr[:,:,2].astype(int)
-    red = (arr[:,:,0] > 150) & (arr[:,:,1] < 100) & (arr[:,:,2] < 100) & ((r - g) > 50)
-    red[:, :50] = False  # 排除左侧导航栏
-    ys = np.where(red)[0]
-    if len(ys) == 0:
-        return []
-    sorted_ys = sorted(set(ys))
-    clusters = []
-    current = [sorted_ys[0]]
-    for y in sorted_ys[1:]:
-        if y - current[-1] <= 20:
-            current.append(y)
-        else:
-            clusters.append(current)
-            current = [y]
-    clusters.append(current)
-    # 合并间距<50px的聚类（同一个会话项上的多个红元素）
-    merged = [clusters[0]]
-    for c in clusters[1:]:
-        if min(c) - max(merged[-1]) < 50:
-            merged[-1] = merged[-1] + c
-        else:
-            merged.append(c)
-    clusters = merged
-    result = []
-    for c in clusters:
-        cy = (min(c) + max(c)) // 2
-        red_in = red[min(c):max(c)+1, :]
-        xs = np.where(red_in.any(axis=0))[0]
-        cx = int((xs.min() + xs.max()) // 2) if len(xs) > 0 else CHAT_X
-        result.append({"y": cy, "x": cx})
-    return result
+CHAT_X = 160  # 侧边栏列表点击x
 
 class AutoPilot:
     def __init__(self):
@@ -85,35 +47,34 @@ class AutoPilot:
         wid = capture.find_wechat_window()
         if not wid: return
 
-        # 激活
         try: subprocess.run(["xdotool","windowactivate","--sync",str(wid)],timeout=5); time.sleep(0.5)
         except: pass
 
-        # 截图
+        # 截侧边栏
         sidebar = capture.capture_sidebar()
         if not sidebar: return
         sidebar_path = str(cfg.config_path.parent / "last_sidebar.png")
         sidebar.save(sidebar_path)
 
-        # 像素检测红点（不耗API，精确到像素）
-        dots = detect_red_dots(sidebar)
-        dots = dots[:3]
-        if not dots:
-            cfg.log(f"#{self._cycle} 无未读"); return
+        # AI扫描（带参考线）→ 精确y坐标
+        unread = llm_client.scan_sidebar_unread(sidebar_path)
+        # 过滤黑名单，点击前就跳过
+        unread = [u for u in unread if not is_blacklisted(u.get("name",""))][:3]
+        if not unread:
+            cfg.log(f"#{self._cycle} 无未读(已过滤黑名单)"); return
 
-        cfg.log(f"#{self._cycle} 红点: {[(d['y'],d['x']) for d in dots]}")
+        cfg.log(f"#{self._cycle} 未读: {[(u['name'],u['y']) for u in unread]}")
 
-        # 逐个点
-        for dot in dots:
-            y = dot["y"] + random.randint(-2,2)
-            x = dot["x"] + random.randint(-5,5)
+        # 逐个点击
+        for item in unread:
+            y = item["y"] + random.randint(-2,2)
+            x = CHAT_X + random.randint(-5,5)
             subprocess.run(["xdotool","mousemove","--window",str(wid),str(x),str(y)],timeout=3)
             time.sleep(0.1)
-            # ponytail: Electron微信不响应xdotool click，用mousedown+mouseup
             subprocess.run(["xdotool","mousedown","1"],timeout=3)
             time.sleep(0.05)
             subprocess.run(["xdotool","mouseup","1"],timeout=3)
-            time.sleep(1.2)
+            time.sleep(2.0)  # 等页面刷新
 
             # 截图看消息
             shot2 = capture.capture_chat_region()

@@ -175,6 +175,61 @@ class LLMClient:
             cfg.log(f"快筛失败: {e}", "WARN")
         return []
 
+    def scan_sidebar_unread(self, image_path: str) -> list:
+        """AI视觉扫描侧边栏，返回未读会话[{name, y}]
+        策略：先画25px间隔参考线，让AI精确读坐标"""
+        from PIL import Image, ImageDraw
+        import io, json
+        img = Image.open(image_path)
+        w, h = img.size
+
+        # 画参考线（每25px一条绿线，避免和红色未读混淆）
+        draw = ImageDraw.Draw(img)
+        for y_line in range(25, h, 25):
+            draw.line([(50, y_line), (w-1, y_line)], fill='green', width=1)
+            draw.text((52, y_line+1), str(y_line), fill='green')
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+
+        scan_prompt = (
+            "这是微信左侧聊天列表截图，上面画了每25像素一条的绿色参考线，左侧标了y坐标数字。\n"
+            "请从上到下找到每个会话条目，找出哪些有红色未读标记（红色数字角标或红点，不是绿色参考线）。\n"
+            "对每个有未读的会话，输出：\n"
+            "- name: 会话名称\n"
+            "- y: 该会话中心对准的y坐标数字（直接读最近的绿色参考线数字）\n\n"
+            "只输出有红色未读标记的会话。格式：[{\"name\":\"xxx\",\"y\":123}]"
+        )
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": scan_prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+        ]}]
+        try:
+            result = _call_llm(messages, temperature=0.1, max_tokens=500)
+            result = result.strip()
+            if "```" in result:
+                parts = result.split("```")
+                result = parts[1].strip()
+                if result.startswith("json"):
+                    result = result[4:].strip()
+            start = result.find("[")
+            end = result.rfind("]") + 1
+            if start >= 0 and end > start:
+                items = json.loads(result[start:end])
+                result_list = []
+                for item in items:
+                    if isinstance(item, dict) and "y" in item:
+                        result_list.append({
+                            "name": str(item.get("name", "")),
+                            "y": int(item["y"])
+                        })
+                cfg.log(f"AI扫描未读: {[(r['name'],r['y']) for r in result_list]}")
+                return result_list
+        except Exception as e:
+            cfg.log(f"AI扫描侧边栏失败: {e}", "WARN")
+        return []
+
     def analyze_chat_screenshot(self, image_path: str) -> dict:
         """用AI视觉分析微信截图，提取聊天内容"""
         try:
