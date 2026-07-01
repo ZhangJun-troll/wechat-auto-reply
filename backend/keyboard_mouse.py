@@ -33,47 +33,44 @@ class KeyboardMouse:
 
     def click_chat_item(self, item_index: int, wid: int = None):
         """点击聊天列表第N项（0=第一项）
-        验证过的坐标:
-        - 聊天列表中心x ≈ 200
-        - 第一项y ≈ 100
-        - 每项间距 ≈ 60px
+        验证过的坐标（窗口内相对坐标）:
         """
         from window_capture import capture
         geo = capture.get_window_geometry(wid)
         if geo is None:
             return
 
-        # 验证过的坐标: x≈200, y从100开始, 间距60px
-        list_x = 200 + random.randint(-10, 10)
-        list_y = 100 + item_index * 60 + random.randint(-3, 3)
+        # 验证过的坐标：x=200, y从130开始, 每项60px
+        CHAT_X = 160
+        CHAT_Y_START = 70
+        CHAT_Y_STEP = 60  # ponytail: 每项60px高
+
+        list_x = CHAT_X + random.randint(-5, 5)
+        list_y = CHAT_Y_START + item_index * CHAT_Y_STEP + random.randint(-2, 2)
 
         self.activate_wechat()
         time.sleep(0.3)
         self._run(["xdotool", "mousemove", "--window", str(wid), str(list_x), str(list_y)])
         time.sleep(0.15)
-        self._run(["xdotool", "click", "1"])
+        # ponytail: Electron微信不响应xdotool click，用mousedown+mouseup
+        self._run(["xdotool", "mousedown", "1"])
+        time.sleep(0.05)
+        self._run(["xdotool", "mouseup", "1"])
         cfg.log(f"点击聊天项 #{item_index}: ({list_x}, {list_y})")
 
     def click_input_box(self, wid: int = None):
-        """点击微信输入框区域
-        验证: 输入框在窗口底部，右侧约65%位置
-        """
-        from window_capture import capture
-        geo = capture.get_window_geometry(wid)
-        if geo is None:
-            return
-
-        w, h = geo["WIDTH"], geo["HEIGHT"]
-        # 验证过的坐标: x≈842(窗口65%处), y≈652(窗口88%处)
-        click_x = int(w * 0.65) + random.randint(-8, 8)
-        click_y = int(h * 0.88) + random.randint(-5, 5)
-
+        """点击微信输入框（写死坐标）"""
         self.activate_wechat()
-        time.sleep(0.2)
-        self._run(["xdotool", "mousemove", "--window", str(wid), str(click_x), str(click_y)])
-        time.sleep(0.1)
-        self._run(["xdotool", "click", "1"])
-        cfg.log(f"点击输入框: ({click_x}, {click_y})")
+        time.sleep(0.3)
+        x = 842 + random.randint(-8, 8)
+        y = 652 + random.randint(-5, 5)
+        self._run(["xdotool","mousemove","--window",str(wid),str(x),str(y)])
+        time.sleep(0.15)
+        # ponytail: Electron微信不响应xdotool click，用mousedown+mouseup
+        self._run(["xdotool","mousedown","1"])
+        time.sleep(0.05)
+        self._run(["xdotool","mouseup","1"])
+        cfg.log(f"点击输入框: ({x}, {y})")
 
     def paste_text(self, text: str):
         """通过剪贴板粘贴文本"""

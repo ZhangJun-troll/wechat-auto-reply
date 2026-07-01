@@ -1,7 +1,5 @@
-"""异步托管 - 截图→AI看→回复，不点击"""
-import threading
-import time
-from typing import Optional
+"""异步托管 - 极简：红点在第几个就点第几个"""
+import threading, time, random, subprocess
 from config import cfg
 from window_capture import capture
 from llm_client import llm_client
@@ -10,118 +8,156 @@ from memory_store import memory_store
 from time_schedule import get_current_interval
 from name_list import is_blacklisted, needs_human_approval
 
+CHAT_X = 160  # ponytail: 侧边栏列表点击x（避开左侧导航图标栏）
+
+def detect_red_dots(img) -> list:
+    """纯算法检测侧边栏红点，返回[{y, x}]（像素检测，不耗API）"""
+    import numpy as np
+    arr = np.array(img)
+    # 红色: R>150, G<100, B<100, R-G>50
+    r, g, b = arr[:,:,0].astype(int), arr[:,:,1].astype(int), arr[:,:,2].astype(int)
+    red = (arr[:,:,0] > 150) & (arr[:,:,1] < 100) & (arr[:,:,2] < 100) & ((r - g) > 50)
+    red[:, :50] = False  # 排除左侧导航栏
+    ys = np.where(red)[0]
+    if len(ys) == 0:
+        return []
+    sorted_ys = sorted(set(ys))
+    clusters = []
+    current = [sorted_ys[0]]
+    for y in sorted_ys[1:]:
+        if y - current[-1] <= 20:
+            current.append(y)
+        else:
+            clusters.append(current)
+            current = [y]
+    clusters.append(current)
+    # 合并间距<50px的聚类（同一个会话项上的多个红元素）
+    merged = [clusters[0]]
+    for c in clusters[1:]:
+        if min(c) - max(merged[-1]) < 50:
+            merged[-1] = merged[-1] + c
+        else:
+            merged.append(c)
+    clusters = merged
+    result = []
+    for c in clusters:
+        cy = (min(c) + max(c)) // 2
+        red_in = red[min(c):max(c)+1, :]
+        xs = np.where(red_in.any(axis=0))[0]
+        cx = int((xs.min() + xs.max()) // 2) if len(xs) > 0 else CHAT_X
+        result.append({"y": cy, "x": cx})
+    return result
 
 class AutoPilot:
     def __init__(self):
-        self._thread: Optional[threading.Thread] = None
         self._running = False
-        self._last_msg_hash = ""
-        self._cycle_count = 0
+        self._thread = None
+        self._last_hash = ""
+        self._cycle = 0
         self._pending = []
 
-    @property
-    def is_running(self): return self._running
-
-    def start(self) -> bool:
+    def start(self):
         if self._running: return False
         if not cfg.config["mimo"]["api_key"]:
-            cfg.log("请先配置API Key", "ERROR"); return False
+            cfg.log("请先配置API Key","ERROR"); return False
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         cfg.log("自动托管已启动"); return True
 
-    def stop(self) -> bool:
-        if not self._running: return False
+    def stop(self):
         self._running = False
         cfg.log("自动托管已停止"); return True
 
+    @property
+    def is_running(self): return self._running
+
     def _loop(self):
         while self._running:
-            try:
-                self._cycle()
-            except Exception as e:
-                cfg.log(f"异常: {e}", "ERROR")
-            for _ in range(int(get_current_interval() * 10)):
+            try: self._tick()
+            except Exception as e: cfg.log(f"异常: {e}","ERROR")
+            for _ in range(int(get_current_interval()*10)):
                 if not self._running: break
                 time.sleep(0.1)
 
-    def _cycle(self):
-        self._cycle_count += 1
+    def _tick(self):
+        self._cycle += 1
         wid = capture.find_wechat_window()
         if not wid: return
 
-        # ponytail: 用裁剪后的聊天区域，不是全窗口
-        shot = capture.capture_chat_region()
-        if not shot: return
-        snap = str(cfg.config_path.parent / "last_snap.png")
-        shot.save(snap)
+        # 激活
+        try: subprocess.run(["xdotool","windowactivate","--sync",str(wid)],timeout=5); time.sleep(0.5)
+        except: pass
 
-        # ponytail: 一次截图AI看全，不点击
-        analysis = llm_client.analyze_chat_screenshot(snap)
-        cur = analysis.get("current_chat", "")
-        msgs = analysis.get("messages", [])
-        need = analysis.get("need_reply", False)
-        latest = analysis.get("latest_sender", "")
-        unread = analysis.get("unread_chats", [])
+        # 截图
+        sidebar = capture.capture_sidebar()
+        if not sidebar: return
+        sidebar_path = str(cfg.config_path.parent / "last_sidebar.png")
+        sidebar.save(sidebar_path)
 
-        cfg.log(f"#{self._cycle_count} [{cur}] msgs={len(msgs)} need={need} unread={unread}")
+        # 像素检测红点（不耗API，精确到像素）
+        dots = detect_red_dots(sidebar)
+        dots = dots[:3]
+        if not dots:
+            cfg.log(f"#{self._cycle} 无未读"); return
 
-        # 没有需要回复的
-        if not need or latest != "other" or not msgs:
+        cfg.log(f"#{self._cycle} 红点: {[(d['y'],d['x']) for d in dots]}")
+
+        # 逐个点
+        for dot in dots:
+            y = dot["y"] + random.randint(-2,2)
+            x = dot["x"] + random.randint(-5,5)
+            subprocess.run(["xdotool","mousemove","--window",str(wid),str(x),str(y)],timeout=3)
+            time.sleep(0.1)
+            # ponytail: Electron微信不响应xdotool click，用mousedown+mouseup
+            subprocess.run(["xdotool","mousedown","1"],timeout=3)
+            time.sleep(0.05)
+            subprocess.run(["xdotool","mouseup","1"],timeout=3)
+            time.sleep(1.2)
+
+            # 截图看消息
+            shot2 = capture.capture_chat_region()
+            if not shot2: continue
+            snap2 = str(cfg.config_path.parent / "last_snap2.png")
+            shot2.save(snap2)
+
+            a = llm_client.analyze_chat_screenshot(snap2)
+            need = a.get("need_reply", False)
+            latest = a.get("latest_sender", "")
+            msgs = a.get("messages", [])
+            cur = a.get("current_chat", "")
+
+            if not (need and latest == "other" and msgs): continue
+            if is_blacklisted(cur): continue
+
+            last = msgs[-1].get("text","")
+            h = f"{cur}:{last[:30]}"
+            if h == self._last_hash: continue
+
+            ctx = "\n".join(f"{'【我】' if m.get('sender')=='me' else '【TA】'}{m.get('text','')}" for m in msgs[-5:])
+
+            if needs_human_approval(cur,last):
+                r = llm_client.generate_replies(ctx)
+                if r: self._pending.append({"chat":cur,"msg":last,"reply":r[0],"context":ctx})
+                self._last_hash = h; return
+
+            r = llm_client.generate_replies(ctx)
+            if not r or r[0].startswith("（"): cfg.log("  生成失败"); continue
+            kb_mouse.send_message(r[0])
+            memory_store.add_reply(r[0],source="ai",context=ctx)
+            self._last_hash = h
+            cfg.log(f"  ✓ 回复 [{cur}]: {r[0][:60]}")
             return
 
-        last = msgs[-1].get("text", "")
-        h = f"{cur}:{last[:30]}"
-        if h == self._last_msg_hash: return
-
-        # 黑名单/系统号
-        if is_blacklisted(cur):
-            cfg.log(f"  跳过黑名单: {cur}"); return
-
-        SKIP = ["公众号", "微信支付", "服务号", "文件传输助手", "微信游戏"]
-        if any(k in cur for k in SKIP):
-            cfg.log(f"  跳过系统号: {cur}"); return
-
-        # 构建上下文
-        ctx = "\n".join(f"{'【我方】' if m.get('sender')=='me' else '【对方】'}{m.get('text','')}" for m in msgs)
-
-        # 白名单/高危 → 存待确认
-        if needs_human_approval(cur, last):
-            replies = llm_client.generate_replies(ctx)
-            if replies:
-                self._pending.append({"chat": cur, "msg": last, "reply": replies[0], "context": ctx})
-                cfg.log(f"  ⚠ 待确认 [{cur}]: {replies[0][:60]}")
-            self._last_msg_hash = h
-            return
-
-        # 普通消息 → 自动回复
-        replies = llm_client.generate_replies(ctx)
-        if not replies or replies[0].startswith("（"):
-            cfg.log("  生成失败"); return
-
-        selected = replies[0]
-        kb_mouse.send_message(selected)
-        memory_store.add_reply(selected, source="ai", context=ctx)
-        self._last_msg_hash = h
-        cfg.log(f"  ✓ 回复 [{cur}]: {selected[:60]}")
-
-    def approve(self, idx: int, text: str = None) -> bool:
-        if idx >= len(self._pending): return False
-        e = self._pending.pop(idx)
-        kb_mouse.send_message(text or e["reply"])
-        memory_store.add_reply(text or e["reply"], source="human_approved")
-        return True
-
-    def reject(self, idx: int):
-        if idx < len(self._pending): self._pending.pop(idx)
-
+    def approve(self,i,t=None):
+        if i>=len(self._pending): return False
+        e=self._pending.pop(i); kb_mouse.send_message(t or e["reply"]); return True
+    def reject(self,i):
+        if i<len(self._pending): self._pending.pop(i)
     def get_pending(self): return self._pending
-
     def get_status(self):
-        from time_schedule import get_slot_info
-        slot = get_slot_info()
-        return {"running": self._running, "cycle_count": self._cycle_count,
-                "pending_count": len(self._pending), "slot": slot.get("name", "默认")}
+        from time_schedule import get_slot_info; s=get_slot_info()
+        return {"running":self._running,"cycle_count":self._cycle,
+                "pending_count":len(self._pending),"slot":s.get("name","默认")}
 
 auto_pilot = AutoPilot()

@@ -15,7 +15,7 @@ def _get_api_config():
     return mimo["api_key"], mimo["base_url"], mimo["model"]
 
 
-def _call_llm(messages: list, temperature=0.7, max_tokens=1024, model_override: str = None) -> str:
+def _call_llm(messages: list, temperature=0.7, max_tokens=1024, model_override: str = None, use_reasoning: bool = False) -> str:
     """通用LLM调用"""
     api_key, base_url, model = _get_api_config()
     if model_override:
@@ -44,8 +44,11 @@ def _call_llm(messages: list, temperature=0.7, max_tokens=1024, model_override: 
     resp.raise_for_status()
     data = resp.json()
     msg = data["choices"][0]["message"]
-    # ponytail: 推理模型把内容放reasoning里，content可能是null
-    return msg.get("content") or msg.get("reasoning") or ""
+    # reasoning模型：content是真实回复，reasoning是思考过程
+    content = msg.get("content") or ""
+    if use_reasoning and not content:
+        content = msg.get("reasoning") or ""
+    return content
 
 
 def _image_to_base64(image_path: str) -> str:
@@ -128,38 +131,46 @@ class LLMClient:
         self._last_analysis: Optional[dict] = None
 
     def quick_scan(self, image_path: str) -> list:
-        """小图快筛：裁左侧列表+缩小，问AI有没有未读"""
+        """快筛：截左侧列表，返回未读会话[{name,y}]"""
         from PIL import Image
         import io
         img = Image.open(image_path)
-        w, h = img.size
-        # ponytail: 裁左侧列表区域 - 用更大范围，文字更清晰
-        sidebar = img.crop((0, 0, int(w*0.45), h))
-        # 缩小到500px宽（保持清晰度）
-        ratio = 500 / sidebar.width
-        small = sidebar.resize((500, int(sidebar.height * ratio)), Image.LANCZOS)
+        w, h = img.size  # ponytail: 保持原尺寸，y坐标要精确
         buf = io.BytesIO()
-        small.save(buf, format="JPEG", quality=90)
+        img.save(buf, format="JPEG", quality=80)
         b64 = base64.b64encode(buf.getvalue()).decode()
 
-        # ponytail: 用视觉模型做快筛，固定model不走配置
-        vision_model = "nvidia/nemotron-nano-12b-v2-vl"
+        # 让AI直接返回y坐标，不用固定间距映射
+        scan_prompt = (
+            f"这是微信左侧聊天列表截图({w}x{h}像素)。"
+            "找出所有有红色未读标记（红色数字角标或红点）的会话。"
+            '对每个未读会话，输出会话名称和其中心y坐标（从图片顶部算的像素值）。'
+            '格式：[{"name":"会话名","y":100}]。没有未读输出[]。只看红色标记。'
+        )
         messages = [{"role": "user", "content": [
-            {"type": "text", "text": "看微信聊天列表截图。哪些名字右边有红色数字角标（未读消息）？输出完整的聊天名字，不要截断。格式：[\"完整名字1\",\"完整名字2\"]。没有就输出[]"},
+            {"type": "text", "text": scan_prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
         ]}]
         try:
-            result = _call_llm(messages, temperature=0.1, max_tokens=500, model_override=vision_model)
+            result = _call_llm(messages, temperature=0.1, max_tokens=500)
             result = result.strip()
             if "```" in result:
                 result = result.split("```")[1].strip()
+            # 解析JSON数组
             start = result.find("[")
             end = result.rfind("]") + 1
             if start >= 0 and end > start:
                 import json
-                names = json.loads(result[start:end])
-                cfg.log(f"快筛发现未读: {names}")
-                return names
+                items = json.loads(result[start:end])
+                # 兼容旧格式（纯数字数组）→ 转成[{name,y}]用默认y
+                result_list = []
+                for i, item in enumerate(items):
+                    if isinstance(item, dict) and "y" in item:
+                        result_list.append({"name": item.get("name",""), "y": int(item["y"])})
+                    elif isinstance(item, int):
+                        result_list.append({"name": "", "y": 70 + (item-1)*50})  # fallback
+                cfg.log(f"快筛发现未读: {[(r['name'],r['y']) for r in result_list]}")
+                return result_list
         except Exception as e:
             cfg.log(f"快筛失败: {e}", "WARN")
         return []
@@ -178,8 +189,9 @@ class LLMClient:
                     ]
                 }
             ]
-            result = _call_llm(messages, temperature=0.3, max_tokens=4096, model_override="nvidia/nemotron-nano-12b-v2-vl")
+            result = _call_llm(messages, temperature=0.3, max_tokens=4096)
             cfg.log(f"AI视觉分析完成")
+            cfg.log(f"AI返回: {result[:200]}")
 
             # 解析JSON
             parsed = self._parse_analysis(result)
@@ -214,7 +226,7 @@ class LLMClient:
                 except:
                     pass
         # 返回默认结构
-        return {"messages": [], "need_reply": False, "current_chat": "unknown", "latest_sender": "unknown"}
+        return {"messages": [], "need_reply": False, "current_chat": "unknown", "latest_sender": "unknown", "unread_chats": []}
 
     def generate_replies(self, chat_context: str, persona: str = "") -> List[str]:
         """生成3条备选回复"""
@@ -238,7 +250,7 @@ class LLMClient:
                 {"role": "system", "content": REPLY_PROMPT},
                 {"role": "user", "content": user_msg}
             ]
-            result = _call_llm(messages, temperature=0.85, max_tokens=512)
+            result = _call_llm(messages, temperature=0.85, max_tokens=512, use_reasoning=True)
             replies = self._parse_replies(result)
             replies = self._filter_ai_talk(replies)
             self._last_replies = replies[:3]

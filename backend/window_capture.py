@@ -138,6 +138,28 @@ class WindowCapture:
             cfg.log(f"截取完整窗口失败: {e}", "ERROR")
             return None
 
+    def capture_sidebar(self, save_path: str = None) -> Optional[Image.Image]:
+        """截取微信左侧聊天列表区域（320px宽）"""
+        geo = self.get_window_geometry()
+        if geo is None:
+            if self.find_wechat_window():
+                geo = self.get_window_geometry()
+            if geo is None:
+                cfg.log("无法获取窗口位置，跳过侧边栏截图", "ERROR")
+                return None
+        SIDEBAR_W = 320  # ponytail: 微信侧边栏宽度，不同版本可能不同
+        try:
+            with mss.mss() as sct:
+                monitor = {"left": geo["X"], "top": geo["Y"], "width": SIDEBAR_W, "height": geo["HEIGHT"]}
+                screenshot = sct.grab(monitor)
+                img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+            if save_path:
+                img.save(save_path)
+            return img
+        except Exception as e:
+            cfg.log(f"截取侧边栏失败: {e}", "ERROR")
+            return None
+
     def is_wechat_active(self) -> bool:
         """检查微信窗口是否当前激活"""
         try:
